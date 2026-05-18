@@ -102,14 +102,15 @@ class MLP(nn.Module):
 
 # Original hyperconnections from https://arxiv.org/abs/2409.19606
 class DynamicHyperconnections(nn.Module):
-    def __init__(self, config):
+    def __init__(self, config, layer_idx):
         super().__init__()
         # assuming input is B, n_streams, C and its dynamic only
         # for h_pre, if x is (n, c), you need to dynamically get n, 1 weights
 
         n_streams = config.n_streams
         dim = config.n_embd
-        
+        self.layer_idx = layer_idx
+
         self.layer_norm = nn.LayerNorm(dim)
         self.tanh = nn.Tanh()
 
@@ -121,7 +122,7 @@ class DynamicHyperconnections(nn.Module):
         self.s_pos_res = nn.Parameter(torch.ones(n_streams, n_streams + 1))
         # most important is the bias
         b_pos = torch.zeros(n_streams, 1)
-        b_pos[n_streams % layer_idx, 0] = 1
+        b_pos[self.layer_idx % n_streams, 0] = 1
         self.b_pos_res = nn.Parameter(
             torch.concat(
                 [torch.eye(n_streams, n_streams),
@@ -136,15 +137,15 @@ class DynamicHyperconnections(nn.Module):
         w_pre = self.s_pre * self.tanh(x_norm @ self.h_pre) + self.b_pre # (n, 1) * ((n, dim) @ (dim, 1)) + (n, 1)
         
         w_pos_res = self.s_pos_res * self.tanh(x_norm @ self.h_pos_res) + self.b_pos_res # (n, n+1) * ((n, dim) @ (dim, n+1)) + (n, n+1)
-        self.w_res = w_pos_res[:, :, :-1] # B, N, N
-        self.w_pos = w_pos_res[:, :, -1].unsqueeze(-1) # B, N, 1
+        self.w_res = w_pos_res[:, :, :, :-1] # B, N, N
+        self.w_pos = w_pos_res[:, :, :, -1:] # B, N, 1
 
-        return w_pre.mT @ x
+        return (w_pre.mT @ x).squeeze(-2)
 
     def post_forward(self, x, out):
         # takes both original input and layers output
-        x_pos = self.w_pos @ out # (n, 1) @ (1, dim)
-        x_res = self.w_res @ x # (n, n), (n, dim)
+        x_pos = self.w_pos @ out.unsqueeze(-2) # (B, N, 1) @ (B, 1, dim) -> (B, N, dim)
+        x_res = self.w_res @ x # (B, N, N) @ (B, N, dim) -> (B, N, dim)
 
         return x_pos + x_res
 
@@ -156,10 +157,26 @@ class Block(nn.Module):
         self.attn = CausalSelfAttention(config)
         self.ln_2 = nn.LayerNorm(config.n_embd)
         self.mlp = MLP(config)
+        self.hc_attn = DynamicHyperconnections(config, layer_idx)
+        self.hc_mlp = DynamicHyperconnections(config, layer_idx)
+        self.n_streams = config.n_streams
 
     def forward(self, x):
-        x = x + self.attn(self.ln_1(x))
-        x = x + self.mlp(self.ln_2(x))
+        # expand to N parallel streams
+        x_stream = torch.concat([x.unsqueeze(-2) for _ in range(self.n_streams)], dim=-2)
+
+        # attention with hyperconnections
+        mixed = self.hc_attn.pre_forward(x_stream)
+        attn_out = self.attn(self.ln_1(mixed))
+        x_stream = self.hc_attn.post_forward(x_stream, attn_out)
+
+        # MLP with hyperconnections
+        mixed = self.hc_mlp.pre_forward(x_stream)
+        mlp_out = self.mlp(self.ln_2(mixed))
+        x_stream = self.hc_mlp.post_forward(x_stream, mlp_out)
+
+        # collapse streams back to single representation
+        x = x_stream.sum(dim=-2)
         return x
 
 # -----------------------------------------------------------------------------
@@ -219,7 +236,6 @@ class GPT(nn.Module):
         pos_emb = self.transformer.wpe(pos) # position embeddings of shape (t, n_embd)
         x = tok_emb + pos_emb
 
-        x_stream = torch.concat([x.unsqueeze(-2) for _ in range(config.n_streams)], dim=-2)
         for block in self.transformer.h:
             x = block(x)
         x = self.transformer.ln_f(x)
