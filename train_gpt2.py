@@ -907,9 +907,11 @@ if __name__ == "__main__":
         tokens_per_second = grad_accum_steps * ddp_world_size * B * T / (t1-t0)
         print0(f"step {step+1:4d}/{args.num_iterations} | train loss {lossf:.6f} | norm {norm:.4f} | lr {lr:.2e} | ({(t1-t0)*1000:.2f} ms | {tokens_per_second:.0f} tok/s)")
         # log to logile
+        mem_gb = torch.cuda.max_memory_allocated() / 1e9
+        torch.cuda.reset_peak_memory_stats()
         if master_process and logfile is not None:
             with open(logfile, "a") as f:
-                f.write("s:%d trl:%f\n" % (step, lossf))
+                f.write("s:%d trl:%f norm:%f mem:%f\n" % (step, lossf, norm, mem_gb))
 
         # keep track of smooth timings, last 20 iterations
         if step > 0 and step > args.num_iterations - 20:
