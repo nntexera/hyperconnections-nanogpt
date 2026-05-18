@@ -100,9 +100,57 @@ class MLP(nn.Module):
         x = self.c_proj(x)
         return x
 
+# Original hyperconnections from https://arxiv.org/abs/2409.19606
+class DynamicHyperconnections(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        # assuming input is B, n_streams, C and its dynamic only
+        # for h_pre, if x is (n, c), you need to dynamically get n, 1 weights
+
+        n_streams = config.n_streams
+        dim = config.n_embd
+        
+        self.layer_norm = nn.LayerNorm(dim)
+        self.tanh = nn.Tanh()
+
+        self.h_pre = nn.Parameter(torch.zeros(dim, 1))
+        self.s_pre = nn.Parameter(torch.ones(n_streams, 1))
+        self.b_pre = nn.Parameter(torch.ones(n_streams, 1))
+
+        self.h_pos_res = nn.Parameter(torch.zeros(dim, n_streams + 1))
+        self.s_pos_res = nn.Parameter(torch.ones(n_streams, n_streams + 1))
+        # most important is the bias
+        b_pos = torch.zeros(n_streams, 1)
+        b_pos[n_streams % layer_idx, 0] = 1
+        self.b_pos_res = nn.Parameter(
+            torch.concat(
+                [torch.eye(n_streams, n_streams),
+                b_pos],
+                dim=1
+            )
+        )
+
+    def pre_forward(self, x: torch.Tensor):
+        x_norm = self.layer_norm(x)
+        
+        w_pre = self.s_pre * self.tanh(x_norm @ self.h_pre) + self.b_pre # (n, 1) * ((n, dim) @ (dim, 1)) + (n, 1)
+        
+        w_pos_res = self.s_pos_res * self.tanh(x_norm @ self.h_pos_res) + self.b_pos_res # (n, n+1) * ((n, dim) @ (dim, n+1)) + (n, n+1)
+        self.w_res = w_pos_res[:, :, :-1] # B, N, N
+        self.w_pos = w_pos_res[:, :, -1].unsqueeze(-1) # B, N, 1
+
+        return w_pre.mT @ x
+
+    def post_forward(self, x, out):
+        # takes both original input and layers output
+        x_pos = self.w_pos @ out # (n, 1) @ (1, dim)
+        x_res = self.w_res @ x # (n, n), (n, dim)
+
+        return x_pos + x_res
+
 class Block(nn.Module):
 
-    def __init__(self, config):
+    def __init__(self, config, layer_idx):
         super().__init__()
         self.ln_1 = nn.LayerNorm(config.n_embd)
         self.attn = CausalSelfAttention(config)
@@ -124,6 +172,7 @@ class GPTConfig:
     n_layer: int = 12
     n_head: int = 12
     n_embd: int = 768
+    n_streams: int = 4
 
 class GPT(nn.Module):
 
@@ -134,7 +183,7 @@ class GPT(nn.Module):
         self.transformer = nn.ModuleDict(dict(
             wte = nn.Embedding(config.vocab_size, config.n_embd),
             wpe = nn.Embedding(config.block_size, config.n_embd),
-            h = nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
+            h = nn.ModuleList([Block(config, i) for i in range(config.n_layer)]),
             ln_f = nn.LayerNorm(config.n_embd),
         ))
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
@@ -170,6 +219,7 @@ class GPT(nn.Module):
         pos_emb = self.transformer.wpe(pos) # position embeddings of shape (t, n_embd)
         x = tok_emb + pos_emb
 
+        x_stream = torch.concat([x.unsqueeze(-2) for _ in range(config.n_streams)], dim=-2)
         for block in self.transformer.h:
             x = block(x)
         x = self.transformer.ln_f(x)
