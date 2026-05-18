@@ -115,11 +115,11 @@ class DynamicHyperconnections(nn.Module):
         self.tanh = nn.Tanh()
 
         self.h_pre = nn.Parameter(torch.zeros(dim, 1))
-        self.s_pre = nn.Parameter(torch.ones(n_streams, 1))
+        self.s_pre = nn.Parameter(torch.ones(1) * 0.01)
         self.b_pre = nn.Parameter(torch.ones(n_streams, 1))
 
         self.h_pos_res = nn.Parameter(torch.zeros(dim, n_streams + 1))
-        self.s_pos_res = nn.Parameter(torch.ones(n_streams, n_streams + 1))
+        self.s_pos_res = nn.Parameter(torch.ones(1) * 0.01)
         # most important is the bias
         b_pos = torch.zeros(n_streams, 1)
         b_pos[self.layer_idx % n_streams, 0] = 1
