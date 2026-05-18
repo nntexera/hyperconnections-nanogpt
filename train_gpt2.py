@@ -24,6 +24,7 @@ import inspect
 from contextlib import nullcontext
 from dataclasses import dataclass
 
+from typing import Optional
 import numpy as np
 import torch
 import torch.nn as nn
@@ -157,26 +158,32 @@ class Block(nn.Module):
         self.attn = CausalSelfAttention(config)
         self.ln_2 = nn.LayerNorm(config.n_embd)
         self.mlp = MLP(config)
-        self.hc_attn = DynamicHyperconnections(config, layer_idx)
-        self.hc_mlp = DynamicHyperconnections(config, layer_idx)
+        self.use_dhc = config.dhc is not None
         self.n_streams = config.n_streams
+        if self.use_dhc:
+            self.hc_attn = DynamicHyperconnections(config, layer_idx)
+            self.hc_mlp = DynamicHyperconnections(config, layer_idx)
 
     def forward(self, x):
-        # expand to N parallel streams
-        x_stream = torch.concat([x.unsqueeze(-2) for _ in range(self.n_streams)], dim=-2)
+        if self.use_dhc:
+            # expand to N parallel streams
+            x_stream = torch.concat([x.unsqueeze(-2) for _ in range(self.n_streams)], dim=-2)
 
-        # attention with hyperconnections
-        mixed = self.hc_attn.pre_forward(x_stream)
-        attn_out = self.attn(self.ln_1(mixed))
-        x_stream = self.hc_attn.post_forward(x_stream, attn_out)
+            # attention with hyperconnections
+            mixed = self.hc_attn.pre_forward(x_stream)
+            attn_out = self.attn(self.ln_1(mixed))
+            x_stream = self.hc_attn.post_forward(x_stream, attn_out)
 
-        # MLP with hyperconnections
-        mixed = self.hc_mlp.pre_forward(x_stream)
-        mlp_out = self.mlp(self.ln_2(mixed))
-        x_stream = self.hc_mlp.post_forward(x_stream, mlp_out)
+            # MLP with hyperconnections
+            mixed = self.hc_mlp.pre_forward(x_stream)
+            mlp_out = self.mlp(self.ln_2(mixed))
+            x_stream = self.hc_mlp.post_forward(x_stream, mlp_out)
 
-        # collapse streams back to single representation
-        x = x_stream.sum(dim=-2)
+            # collapse streams back to single representation
+            x = x_stream.sum(dim=-2)
+        else:
+            x = x + self.attn(self.ln_1(x))
+            x = x + self.mlp(self.ln_2(x))
         return x
 
 # -----------------------------------------------------------------------------
@@ -190,6 +197,7 @@ class GPTConfig:
     n_head: int = 12
     n_embd: int = 768
     n_streams: int = 4
+    dhc: Optional[str] = None  # None = standard residuals, "hc" = DynamicHyperconnections
 
 class GPT(nn.Module):
 
@@ -256,7 +264,7 @@ class GPT(nn.Module):
         return logits, loss
 
     @classmethod
-    def from_pretrained(cls, model_type):
+    def from_pretrained(cls, model_type, dhc=None):
         """Loads pretrained GPT-2 model weights from huggingface"""
         assert model_type in {'gpt2', 'gpt2-medium', 'gpt2-large', 'gpt2-xl'}
         from transformers import GPT2LMHeadModel
@@ -271,6 +279,7 @@ class GPT(nn.Module):
         }[model_type]
         config_args['vocab_size'] = 50257 # always 50257 for GPT model checkpoints
         config_args['block_size'] = 1024 # always 1024 for GPT model checkpoints
+        config_args['dhc'] = dhc
         # create a from-scratch initialized minGPT model
         config = GPTConfig(**config_args)
         model = GPT(config)
@@ -612,6 +621,7 @@ if __name__ == "__main__":
     parser.add_argument("--input_val_bin", type=str, default="", help="input .bin to eval validation loss on")
     parser.add_argument("--output_dir", type=str, default="", help="output directory to which to write logs and checkpoints")
     parser.add_argument("--model", type=str, default="gpt2", help="gpt2|gpt2-medium|gpt2-large|gpt2-xl|d12|d24|d36|d48")
+    parser.add_argument("--dhc", type=str, default=None, nargs="?", const="hc", help="None (standard residuals) | hc (DynamicHyperconnections)")
     # token layout for each step of the optimization
     parser.add_argument("--batch_size", type=int, default=4, help="batch size, in units of #batch dimensions")
     parser.add_argument("--sequence_length", type=int, default=64, help="sequence length")
@@ -718,15 +728,15 @@ if __name__ == "__main__":
     if args.model[0] == "d":
         # from scratch (random weights)
         model_config = {
-            "d12": GPTConfig(block_size=1024, vocab_size=50257, n_layer=12, n_head=12, n_embd=768),
-            "d24": GPTConfig(block_size=1024, vocab_size=50257, n_layer=24, n_head=16, n_embd=1024),
-            "d36": GPTConfig(block_size=1024, vocab_size=50257, n_layer=36, n_head=20, n_embd=1280),
-            "d48": GPTConfig(block_size=1024, vocab_size=50257, n_layer=48, n_head=25, n_embd=1600),
+            "d12": GPTConfig(block_size=1024, vocab_size=50257, n_layer=12, n_head=12, n_embd=768, dhc=args.dhc),
+            "d24": GPTConfig(block_size=1024, vocab_size=50257, n_layer=24, n_head=16, n_embd=1024, dhc=args.dhc),
+            "d36": GPTConfig(block_size=1024, vocab_size=50257, n_layer=36, n_head=20, n_embd=1280, dhc=args.dhc),
+            "d48": GPTConfig(block_size=1024, vocab_size=50257, n_layer=48, n_head=25, n_embd=1600, dhc=args.dhc),
         }[args.model]
         model = GPT(model_config)
     else:
         # load the GPT-2 model weights
-        model = GPT.from_pretrained(args.model)
+        model = GPT.from_pretrained(args.model, dhc=args.dhc)
     model.train()
     model.to(device)
     if args.compile:
