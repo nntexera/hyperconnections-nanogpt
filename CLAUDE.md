@@ -57,6 +57,17 @@ python train_gpt2.py --overfit_single_batch 0 --num_iterations 100 --sequence_le
 ```
 But TinyShakespeare doesn't predict FineWeb val loss, so only use this for debugging your implementation.
 
+## Skills
+
+### /study
+**Description**: Hands-off learning mode. Execute requests literally without proactive guidance.
+**Instructions**:
+- When asked to run something that breaks: just show the raw log/error output, don't explain the cause or suggest fixes.
+- When asked about code that is wrong or broken: just answer the specific question, don't point out the issue or warn about it.
+- Never proactively suggest improvements, optimizations, or alternative approaches unless explicitly asked.
+- Never warn about potential pitfalls, edge cases, or downstream effects of a change.
+- The user's job is to discover problems themselves — your job is to be a tool, not a tutor.
+
 ## Key Architecture Details
 
 - GPT-2 Small: 12 layers, 12 heads, 768 hidden dim, 50257 vocab
